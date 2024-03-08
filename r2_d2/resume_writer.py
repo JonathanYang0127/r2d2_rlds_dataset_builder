@@ -29,6 +29,8 @@ class ResumeWriter(Writer):
       resume_dir: Directory of incomplete files from previous run.
     """
     super().__init__(*args, **kwargs)
+    if resume_dir is None:
+        return
 
     # load sequences from previous run & add them to shuffler
 

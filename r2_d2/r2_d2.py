@@ -42,42 +42,42 @@ MAX_PATHS_IN_MEMORY = 600            # number of paths converted & stored in mem
 
 # optionally provide info to resume conversion from a previous run
 #RESUME_DIR = "/nfs/kun2/datasets/r2d2/tfds/r2_d2/1.0.0.incomplete0DSARA"
-RESUME_DIR = None #"/nfs/kun2/datasets/r2d2/tfds/r2_d2_2/r2_d2/1.0.0.incompleteASWPLN"
-START_CHUNK = 0 #82
+RESUME_DIR = None #"/nfs/kun2/datasets/r2d2/tfds/r2_d2/r2_d2/1.0.0.incomplete22QEZD"
+START_CHUNK = 0 #124
 
 
-_embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-large/5")
-language_instruction = ''
-dummy_language_embedding = _embed([language_instruction])[0].numpy()
+#_embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-large/5")
+#language_instruction = ''
+#dummy_language_embedding = _embed([language_instruction])[0].numpy()
 
-with open("/nfs/kun2/datasets/r2d2/r2d2-data-full/aggregated-annotations-r2d2.json", "r") as F:
+with open("/nfs/kun2/datasets/r2d2/aggregated-annotations-030724.json", "r") as F:
     language_annotations = json.load(F)
 
 # remove pilot vs batch etc leading word in key
-cleaned_language_annotations = {}
-for key in tqdm.tqdm(language_annotations.keys()):
-    cleaned_language_annotations[key.split('/')[-1]] = language_annotations[key]
+#cleaned_language_annotations = {}
+#for key in tqdm.tqdm(language_annotations.keys()):
+#    cleaned_language_annotations[key.split('/')[-1]] = language_annotations[key]
 
 
-def get_language_annotations(key):
-    annot = cleaned_language_annotations[key]
-    return (
-        annot.get("language_instruction1", '') + annot.get("language_instruction1_label", ''),
-        annot.get("language_instruction2", '') + annot.get("language_instruction2_label_1", ''),
-        annot.get("language_instruction3", '') + annot.get("language_instruction2_label_2", '')
-    )
+#def get_language_annotations(key):
+#    annot = cleaned_language_annotations[key]
+#    return (
+#        annot.get("language_instruction1", ''), # + annot.get("language_instruction1_label", ''),
+#        annot.get("language_instruction2", ''), # + annot.get("language_instruction2_label_1", ''),
+#        annot.get("language_instruction3", ''), # + annot.get("language_instruction2_label_2", '')
+#    )
 
 
 # pre-compute all Kona embeddings
-language_annotation_embeddings = dict()
-for key in tqdm.tqdm(cleaned_language_annotations.keys()):
-    annot = cleaned_language_annotations[key]
-    embed_1, embed_2, embed_3 = tuple(_embed(get_language_annotations(key)).numpy())
-    language_annotation_embeddings[key] = dict(
-        language_embedding=embed_1,
-        language_embedding_2=embed_2,
-        language_embedding_3=embed_3,
-    )
+#language_annotation_embeddings = dict()
+#for key in tqdm.tqdm(language_annotations.keys()):
+#    annot = cleaned_language_annotations[key]
+    #embed_1, embed_2, embed_3 = tuple(_embed(get_language_annotations(key)).numpy())
+    #language_annotation_embeddings[key] = dict(
+    #    language_embedding=embed_1,
+    #    language_embedding_2=embed_2,
+    #    language_embedding_3=embed_3,
+    #)
 
 
 camera_type_dict = {
@@ -470,19 +470,22 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         # get language instructions if available
         try:
             metadata_file = glob.glob(episode_path + "/metadata_*.json")[0]
-            traj_id = metadata_file[:-5].split('/')[-1].split('_')[-1] + '.mp4'
-            if traj_id in cleaned_language_annotations:
-                lang_1, lang_2, lang_3 = get_language_annotations(traj_id)
-                lang_e_1 = language_annotation_embeddings[traj_id]['language_embedding']
-                lang_e_2 = language_annotation_embeddings[traj_id]['language_embedding_2']
-                lang_e_3 = language_annotation_embeddings[traj_id]['language_embedding_3']
+            traj_id = metadata_file[:-5].split('/')[-1].split('_')[-1] #+ '.mp4'
+            if traj_id in language_annotations:
+                lang_1 = language_annotations[traj_id].get("language_instruction1", "").rstrip()
+                lang_2 = language_annotations[traj_id].get("language_instruction2", "").rstrip()
+                lang_3 = language_annotations[traj_id].get("language_instruction3", "").rstrip()
+                #lang_1, lang_2, lang_3 = get_language_annotations(traj_id)
+                #lang_e_1 = language_annotation_embeddings[traj_id]['language_embedding']
+                #lang_e_2 = language_annotation_embeddings[traj_id]['language_embedding_2']
+                #lang_e_3 = language_annotation_embeddings[traj_id]['language_embedding_3']
             else:
                 lang_1 = ''
                 lang_2 = ''
                 lang_3 = ''
-                lang_e_1 = dummy_language_embedding
-                lang_e_2 = dummy_language_embedding
-                lang_e_3 = dummy_language_embedding
+                #lang_e_1 = dummy_language_embedding
+                #lang_e_2 = dummy_language_embedding
+                #lang_e_3 = dummy_language_embedding
         except:
            print(f"Skipping trajectory {episode_path}.")
            return None
@@ -546,9 +549,9 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     'language_instruction': lang_1,
                     'language_instruction_2': lang_2,
                     'language_instruction_3': lang_3,
-                    'language_embedding': lang_e_1,
-                    'language_embedding_2': lang_e_2,
-                    'language_embedding_3': lang_e_3,
+                    #'language_embedding': lang_e_1,
+                    #'language_embedding_2': lang_e_2,
+                    #'language_embedding_3': lang_e_3,
                 })
         except:
            print(f"Skipping trajectory {episode_path}.")
@@ -570,7 +573,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
        yield _parse_example(sample)
 
 
-class R2D2(tfds.core.GeneratorBasedBuilder):
+class Droid(tfds.core.GeneratorBasedBuilder):
     """DatasetBuilder for example dataset."""
 
     VERSION = tfds.core.Version('1.0.0')
@@ -706,22 +709,22 @@ class R2D2(tfds.core.GeneratorBasedBuilder):
                     'language_instruction_3': tfds.features.Text(
                         doc='Alternative Language Instruction.'
                     ),
-                    'language_embedding': tfds.features.Tensor(
-                        shape=(512,),
-                        dtype=np.float32,
-                        doc='Kona language embedding. '
-                            'See https://tfhub.dev/google/universal-sentence-encoder-large/5'
-                    ),
-                    'language_embedding_2': tfds.features.Tensor(
-                        shape=(512,),
-                        dtype=np.float32,
-                        doc='Alternative Kona language embedding.'
-                    ),
-                    'language_embedding_3': tfds.features.Tensor(
-                        shape=(512,),
-                        dtype=np.float32,
-                        doc='Alternative Kona language embedding.'
-                    ),
+                    #'language_embedding': tfds.features.Tensor(
+                    #    shape=(512,),
+                    #    dtype=np.float32,
+                    #    doc='Kona language embedding. '
+                    #        'See https://tfhub.dev/google/universal-sentence-encoder-large/5'
+                    #),
+                    #'language_embedding_2': tfds.features.Tensor(
+                    #    shape=(512,),
+                    #    dtype=np.float32,
+                    #    doc='Alternative Kona language embedding.'
+                    #),
+                    #'language_embedding_3': tfds.features.Tensor(
+                    #    shape=(512,),
+                    #    dtype=np.float32,
+                    #    doc='Alternative Kona language embedding.'
+                    #),
                 }),
                 'episode_metadata': tfds.features.FeaturesDict({
                     'file_path': tfds.features.Text(
@@ -737,11 +740,12 @@ class R2D2(tfds.core.GeneratorBasedBuilder):
         """Define data splits."""
         # create list of all examples
         print("Crawling all episode paths...")
-        episode_paths = [] #crawler('/nfs/kun2/datasets/r2d2/r2d2-data-full')
+        episode_paths = crawler('/nfs/kun2/datasets/r2d2/r2d2-data-full')
         # episode_paths = crawler('/nfs/kun2/datasets/r2d2/r2d2_iris_finetune')
         print(f"Found {len(episode_paths)} candidates.")
         episode_paths = [p for p in episode_paths if os.path.exists(p + '/trajectory.h5') and \
                          os.path.exists(p + '/recordings/MP4')]
+        random.shuffle(episode_paths)
         print(f"Found {len(episode_paths)} episodes!")
         #from collections import Counter
         #cc = Counter(episode_paths)
@@ -890,7 +894,7 @@ class ParallelSplitBuilder(split_builder_lib.SplitBuilder):
         path_lists = chunk_max(paths, N_WORKERS, MAX_PATHS_IN_MEMORY)  # generate N file lists
         print(f"Generating with {N_WORKERS} workers!")
         pool = Pool(processes=N_WORKERS)
-        for i in []: #range(START_CHUNK, len(path_lists)):
+        for i in range(START_CHUNK, len(path_lists)):
             paths = path_lists[i]
             print(f"Processing chunk {i + 1} of {len(path_lists)}.")
             results = pool.map(
