@@ -1,10 +1,10 @@
+import shutil
 from typing import Iterator, Tuple, Any, Dict, Union, Callable, Iterable
 
 import glob
 import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
-import tensorflow_hub as hub
 import os
 import cv2
 import h5py
@@ -41,44 +41,13 @@ MAX_PATHS_IN_MEMORY = 600            # number of paths converted & stored in mem
                                     # note that one path may yield multiple episodes and adjust accordingly
 
 # optionally provide info to resume conversion from a previous run
-#RESUME_DIR = "/nfs/kun2/datasets/r2d2/tfds/r2_d2/1.0.0.incomplete0DSARA"
-RESUME_DIR = None #"/nfs/kun2/datasets/r2d2/tfds/r2_d2/r2_d2/1.0.0.incomplete22QEZD"
-START_CHUNK = 0 #124
+DATA_DIR = "gs://xembodiment_data/r2d2/r2d2-data-full"
+ANNOTATION_FILE = "aggregated-annotations-030724.json"
+RESUME_DIR = None
+START_CHUNK = 0
 
-
-#_embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder-large/5")
-#language_instruction = ''
-#dummy_language_embedding = _embed([language_instruction])[0].numpy()
-
-with open("/nfs/kun2/datasets/r2d2/aggregated-annotations-030724.json", "r") as F:
+with open(ANNOTATION_FILE) as F:
     language_annotations = json.load(F)
-
-# remove pilot vs batch etc leading word in key
-#cleaned_language_annotations = {}
-#for key in tqdm.tqdm(language_annotations.keys()):
-#    cleaned_language_annotations[key.split('/')[-1]] = language_annotations[key]
-
-
-#def get_language_annotations(key):
-#    annot = cleaned_language_annotations[key]
-#    return (
-#        annot.get("language_instruction1", ''), # + annot.get("language_instruction1_label", ''),
-#        annot.get("language_instruction2", ''), # + annot.get("language_instruction2_label_1", ''),
-#        annot.get("language_instruction3", ''), # + annot.get("language_instruction2_label_2", '')
-#    )
-
-
-# pre-compute all Kona embeddings
-#language_annotation_embeddings = dict()
-#for key in tqdm.tqdm(language_annotations.keys()):
-#    annot = cleaned_language_annotations[key]
-    #embed_1, embed_2, embed_3 = tuple(_embed(get_language_annotations(key)).numpy())
-    #language_annotation_embeddings[key] = dict(
-    #    language_embedding=embed_1,
-    #    language_embedding_2=embed_2,
-    #    language_embedding_3=embed_3,
-    #)
-
 
 camera_type_dict = {
     'hand_camera_id': 0,
@@ -101,6 +70,13 @@ def get_camera_type(cam_id):
     return type_str
 
 
+def make_local_file(filepath):
+    """Copies file from remote to local temp dir."""
+    local_path = os.path.join("/tmp", os.path.basename(filepath))
+    tf.io.gfile.copy(filepath, local_path)
+    return local_path
+
+
 class MP4Reader:
     def __init__(self, filepath, serial_number):
         # Save Parameters #
@@ -108,7 +84,8 @@ class MP4Reader:
         self._index = 0
 
         # Open Video Reader #
-        self._mp4_reader = cv2.VideoCapture(filepath)
+        self._local_file = make_local_file(filepath)
+        self._mp4_reader = cv2.VideoCapture(self._local_file)
         if not self._mp4_reader.isOpened():
             raise RuntimeError("Corrupted MP4 File")
 
@@ -188,6 +165,8 @@ class MP4Reader:
     def disable_camera(self):
         if hasattr(self, "_mp4_reader"):
             self._mp4_reader.release()
+        os.remove(self._local_file)
+
 
 
 class RecordedMultiCameraWrapper:
@@ -196,8 +175,8 @@ class RecordedMultiCameraWrapper:
         self.camera_kwargs = camera_kwargs
 
         # Open Camera Readers #
-        svo_filepaths = [] #glob.glob(recording_folderpath + "/*.svo")
-        mp4_filepaths = glob.glob(recording_folderpath + "/*.mp4")
+        svo_filepaths = []
+        mp4_filepaths = tf.io.gfile.glob(recording_folderpath + "/*.mp4")
         all_filepaths = svo_filepaths + mp4_filepaths
 
         self.camera_dict = {}
@@ -246,6 +225,9 @@ class RecordedMultiCameraWrapper:
 
         return full_obs_dict
 
+    def close(self):
+        for key in self.camera_dict:
+            self.camera_dict[key].disable_camera()
 
 
 def get_hdf5_length(hdf5_file, keys_to_ignore=[]):
@@ -291,7 +273,8 @@ def load_hdf5_to_dict(hdf5_file, index, keys_to_ignore=[]):
 
 class TrajectoryReader:
     def __init__(self, filepath, read_images=True):
-        self._hdf5_file = h5py.File(filepath, "r")
+        self._local_h5_file = make_local_file(filepath)
+        self._hdf5_file = h5py.File(self._local_h5_file, "r")
         is_video_folder = "observations/videos" in self._hdf5_file
         self._read_images = read_images and is_video_folder
         self._length = get_hdf5_length(self._hdf5_file)
@@ -346,11 +329,12 @@ class TrajectoryReader:
 
     def close(self):
         self._hdf5_file.close()
+        os.remove(self._local_h5_file)
 
 
 def crawler(dirname, filter_func=None):
-    subfolders = [f.path for f in os.scandir(dirname) if f.is_dir()]
-    traj_files = [f.path for f in os.scandir(dirname) if (f.is_file() and "trajectory.h5" in f.path)]
+    subfolders = [f for f in tf.io.gfile.listdir(dirname) if tf.io.gfile.isdir(f)]
+    traj_files = [f for f in tf.io.gfile.listdir(dirname) if (not tf.io.gfile.isdir(f) and "trajectory.h5" in f)]
 
     if len(traj_files):
         # Only Save Desired Data #
@@ -366,7 +350,6 @@ def crawler(dirname, filter_func=None):
 
     all_folderpaths = []
     for child_dirname in subfolders:
-        #if 'ILIAD' not in child_dirname: continue
         child_paths = crawler(child_dirname, filter_func=filter_func)
         all_folderpaths.extend(child_paths)
 
@@ -442,6 +425,8 @@ def load_trajectory(
 
     # Close Readers #
     traj_reader.close()
+    if read_recording_folderpath:
+        camera_reader.close()
 
     # Return Data #
     return timestep_list
@@ -469,38 +454,19 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
 
         # get language instructions if available
         try:
-            metadata_file = glob.glob(episode_path + "/metadata_*.json")[0]
-            traj_id = metadata_file[:-5].split('/')[-1].split('_')[-1] #+ '.mp4'
+            metadata_file = tf.io.gfile.glob(episode_path + "/metadata_*.json")[0]
+            traj_id = metadata_file[:-5].split('/')[-1].split('_')[-1]
             if traj_id in language_annotations:
                 lang_1 = language_annotations[traj_id].get("language_instruction1", "").rstrip()
                 lang_2 = language_annotations[traj_id].get("language_instruction2", "").rstrip()
                 lang_3 = language_annotations[traj_id].get("language_instruction3", "").rstrip()
-                #lang_1, lang_2, lang_3 = get_language_annotations(traj_id)
-                #lang_e_1 = language_annotation_embeddings[traj_id]['language_embedding']
-                #lang_e_2 = language_annotation_embeddings[traj_id]['language_embedding_2']
-                #lang_e_3 = language_annotation_embeddings[traj_id]['language_embedding_3']
             else:
                 lang_1 = ''
                 lang_2 = ''
                 lang_3 = ''
-                #lang_e_1 = dummy_language_embedding
-                #lang_e_2 = dummy_language_embedding
-                #lang_e_3 = dummy_language_embedding
         except:
            print(f"Skipping trajectory {episode_path}.")
            return None
-
-        # if "food_bowl_in_out" in episode_path:
-        #     lang_1 = lang_2 = lang_3 = "put the food in the bowl"
-        # elif "food_microwave_in_out" in episode_path:
-        #     lang_1 = lang_2 = lang_3 = "put the food in the microwave"
-        # elif "microwave_open_close" in episode_path:
-        #     lang_1 = lang_2 = lang_3 = "open and close the microwave"
-        # elif "press_toaster" in episode_path:
-        #     lang_1 = lang_2 = lang_3 = "press the toaster"
-        # elif "wipe_microwave" in episode_path:
-        #     lang_1 = lang_2 = lang_3 = "wipe the microwave"
-        # lang_e_1 = lang_e_2 = lang_e_3 = dummy_language_embedding
 
         try:
             assert all(t.keys() == data[0].keys() for t in data)
@@ -549,9 +515,6 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     'language_instruction': lang_1,
                     'language_instruction_2': lang_2,
                     'language_instruction_3': lang_3,
-                    #'language_embedding': lang_e_1,
-                    #'language_embedding_2': lang_e_2,
-                    #'language_embedding_3': lang_e_3,
                 })
         except:
            print(f"Skipping trajectory {episode_path}.")
@@ -709,22 +672,6 @@ class Droid(tfds.core.GeneratorBasedBuilder):
                     'language_instruction_3': tfds.features.Text(
                         doc='Alternative Language Instruction.'
                     ),
-                    #'language_embedding': tfds.features.Tensor(
-                    #    shape=(512,),
-                    #    dtype=np.float32,
-                    #    doc='Kona language embedding. '
-                    #        'See https://tfhub.dev/google/universal-sentence-encoder-large/5'
-                    #),
-                    #'language_embedding_2': tfds.features.Tensor(
-                    #    shape=(512,),
-                    #    dtype=np.float32,
-                    #    doc='Alternative Kona language embedding.'
-                    #),
-                    #'language_embedding_3': tfds.features.Tensor(
-                    #    shape=(512,),
-                    #    dtype=np.float32,
-                    #    doc='Alternative Kona language embedding.'
-                    #),
                 }),
                 'episode_metadata': tfds.features.FeaturesDict({
                     'file_path': tfds.features.Text(
@@ -740,16 +687,12 @@ class Droid(tfds.core.GeneratorBasedBuilder):
         """Define data splits."""
         # create list of all examples
         print("Crawling all episode paths...")
-        episode_paths = crawler('/nfs/kun2/datasets/r2d2/r2d2-data-full')
-        # episode_paths = crawler('/nfs/kun2/datasets/r2d2/r2d2_iris_finetune')
+        episode_paths = crawler(DATA_DIR)
         print(f"Found {len(episode_paths)} candidates.")
-        episode_paths = [p for p in episode_paths if os.path.exists(p + '/trajectory.h5') and \
-                         os.path.exists(p + '/recordings/MP4')]
+        episode_paths = [p for p in episode_paths if tf.io.gfile.exists(p + '/trajectory.h5') and \
+                         tf.io.gfile.exists(p + '/recordings/MP4')]
         random.shuffle(episode_paths)
         print(f"Found {len(episode_paths)} episodes!")
-        #from collections import Counter
-        #cc = Counter(episode_paths)
-        #breakpoint()
         return {
             'train': episode_paths,
         }

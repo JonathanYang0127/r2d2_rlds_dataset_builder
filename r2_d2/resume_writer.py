@@ -46,7 +46,7 @@ class ResumeWriter(Writer):
                 data = fobj.read(size)
                 yield hkey, data
 
-    tmp_bucket_files = glob.glob(os.path.join(resume_dir, "bucket_*.tmp"))
+    tmp_bucket_files = tf.io.gfile.glob(os.path.join(resume_dir, "bucket_*.tmp"))
     print(f"Found {len(tmp_bucket_files)} temp buckets from previous run.")
     if len(tmp_bucket_files) > 0:
         print("Resuming...")
