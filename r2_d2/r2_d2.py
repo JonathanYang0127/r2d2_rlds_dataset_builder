@@ -8,7 +8,9 @@ import tensorflow_datasets as tfds
 import os
 import cv2
 import h5py
+import psutil
 import json
+import time
 import tqdm
 import io
 from collections import defaultdict
@@ -17,6 +19,7 @@ from copy import deepcopy
 from PIL import Image
 
 import itertools
+import hashlib
 from multiprocessing import Pool
 from functools import partial
 from tensorflow_datasets.core import download
@@ -36,13 +39,14 @@ Example = Dict[str, Any]
 KeyExample = Tuple[Key, Example]
 
 N_WORKERS = 40 # number of parallel workers for data conversion
-MAX_PATHS_IN_MEMORY = 600            # number of paths converted & stored in memory before writing to disk
+MAX_PATHS_IN_MEMORY = 400            # number of paths converted & stored in memory before writing to disk
                                     # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
                                     # note that one path may yield multiple episodes and adjust accordingly
 
 # optionally provide info to resume conversion from a previous run
 DATA_DIR = "gs://xembodiment_data/r2d2/r2d2-data-full"
-ANNOTATION_FILE = "aggregated-annotations-030724.json"
+ANNOTATION_FILE = "aggregated-annotations-082424.json"
+TEMP_DIR = "/mnt/data_disk"
 RESUME_DIR = None
 START_CHUNK = 0
 
@@ -72,7 +76,8 @@ def get_camera_type(cam_id):
 
 def make_local_file(filepath):
     """Copies file from remote to local temp dir."""
-    local_path = os.path.join("/tmp", os.path.basename(filepath))
+    path_hash = hashlib.sha256(filepath.encode("utf-8"))
+    local_path = os.path.join(TEMP_DIR, path_hash.hexdigest())
     tf.io.gfile.copy(filepath, local_path)
     return local_path
 
@@ -85,6 +90,9 @@ class MP4Reader:
 
         # Open Video Reader #
         self._local_file = make_local_file(filepath)
+        if os.path.getsize(self._local_file) > 100_000_000:
+            print(f"File {filepath} is larger than 100MB -- skipping")
+            raise ValueError
         self._mp4_reader = cv2.VideoCapture(self._local_file)
         if not self._mp4_reader.isOpened():
             raise RuntimeError("Corrupted MP4 File")
@@ -333,8 +341,8 @@ class TrajectoryReader:
 
 
 def crawler(dirname, filter_func=None):
-    subfolders = [f for f in tf.io.gfile.listdir(dirname) if tf.io.gfile.isdir(f)]
-    traj_files = [f for f in tf.io.gfile.listdir(dirname) if (not tf.io.gfile.isdir(f) and "trajectory.h5" in f)]
+    subfolders = [os.path.join(dirname, f) for f in tf.io.gfile.listdir(dirname) if tf.io.gfile.isdir(os.path.join(dirname, f))]
+    traj_files = [os.path.join(dirname, f) for f in tf.io.gfile.listdir(dirname) if (not tf.io.gfile.isdir(os.path.join(dirname, f)) and "trajectory.h5" in f)]
 
     if len(traj_files):
         # Only Save Desired Data #
@@ -358,6 +366,8 @@ def crawler(dirname, filter_func=None):
 
 def load_trajectory(
     filepath=None,
+    traj_reader=None,
+    camera_reader=None,
     read_cameras=True,
     recording_folderpath=None,
     camera_kwargs={},
@@ -368,9 +378,9 @@ def load_trajectory(
     read_hdf5_images = read_cameras and (recording_folderpath is None)
     read_recording_folderpath = read_cameras and (recording_folderpath is not None)
 
-    traj_reader = TrajectoryReader(filepath, read_images=read_hdf5_images)
-    if read_recording_folderpath:
-        camera_reader = RecordedMultiCameraWrapper(recording_folderpath, camera_kwargs)
+    #traj_reader = TrajectoryReader(filepath, read_images=read_hdf5_images)
+    #if read_recording_folderpath:
+    #    camera_reader = RecordedMultiCameraWrapper(recording_folderpath, camera_kwargs)
 
     horizon = traj_reader.length()
     timestep_list = []
@@ -445,10 +455,23 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         h5_filepath = os.path.join(episode_path, 'trajectory.h5')
         recording_folderpath = os.path.join(episode_path, 'recordings', 'MP4')
 
+        while psutil.virtual_memory().percent > 85:
+            print("Waiting for RAM...")
+            time.sleep(np.random.rand() * 5)
+
+        traj_reader = None
+        camera_reader = None
         try:
-            traj = load_trajectory(h5_filepath, recording_folderpath=recording_folderpath)
-        except:
-           print(f"Skipping trajectory {episode_path}.")
+            traj_reader = TrajectoryReader(h5_filepath, read_images=True)
+            camera_reader = RecordedMultiCameraWrapper(recording_folderpath, {})
+            traj = load_trajectory(h5_filepath, traj_reader=traj_reader, camera_reader=camera_reader, recording_folderpath=recording_folderpath)
+        except Exception as e:
+           print(e)
+           print(f"Skipping, failed to load trajectory {episode_path}")
+           if traj_reader is not None:
+               traj_reader.close()
+           if camera_reader is not None:
+               camera_reader.close()
            return None
         data = traj[::FRAMESKIP]
 
@@ -465,8 +488,15 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 lang_2 = ''
                 lang_3 = ''
         except:
-           print(f"Skipping trajectory {episode_path}.")
+           print(f"Skipping trajectory {episode_path}. Failed to extract language.")
            return None
+        
+        try:
+            with tf.io.gfile.GFile(metadata_file) as f:
+                metadata_info = json.load(f)
+        except:
+            print(f"Skipping trajectory {episode_path}. Failed to read metadata.")
+            return None
 
         try:
             assert all(t.keys() == data[0].keys() for t in data)
@@ -517,7 +547,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     'language_instruction_3': lang_3,
                 })
         except:
-           print(f"Skipping trajectory {episode_path}.")
+           print(f"Skipping, failed to parse  trajectory {episode_path}")
            return None
 
         # create output data sample
@@ -525,8 +555,16 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
             'steps': episode,
             'episode_metadata': {
                 'file_path': h5_filepath,
-                'recording_folderpath': recording_folderpath
-            }
+                'recording_folderpath': recording_folderpath,
+                'extrinsics_exterior_cam_1': np.array(metadata_info["ext1_cam_extrinsics"]),
+                'extrinsics_exterior_cam_2': np.array(metadata_info["ext2_cam_extrinsics"]),
+                'extrinsics_wrist_cam': np.array(metadata_info["wrist_cam_extrinsics"]),
+                'collector_id': metadata_info["user_id"],
+                'date': metadata_info["user_id"],
+                'building': metadata_info["building"],
+                'scene_id': metadata_info["scene_id"],
+                'task_category': metadata_info["current_task"],
+            },
         }
         # if you want to skip an example for whatever reason, simply return None
         return episode_path, sample
@@ -539,12 +577,14 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
 class Droid(tfds.core.GeneratorBasedBuilder):
     """DatasetBuilder for example dataset."""
 
-    VERSION = tfds.core.Version('1.0.0')
+    VERSION = tfds.core.Version('1.0.1')
     RELEASE_NOTES = {
       '1.0.0': 'Initial release.',
+      '1.0.1': 'Language annotation for all success episodes, additional metadata.',
     }
 
     def __init__(self, *args, **kwargs):
+        self._paths = None
         super().__init__(*args, **kwargs)
 
     def _info(self) -> tfds.core.DatasetInfo:
@@ -679,7 +719,38 @@ class Droid(tfds.core.GeneratorBasedBuilder):
                     ),
                     'recording_folderpath': tfds.features.Text(
                         doc='Path to the folder of recordings.'
-                    )
+                    ),
+                    'extrinsics_exterior_cam_1': tfds.features.Tensor(
+                        shape=(6,),
+                        dtype=np.float64,
+                        doc='Extrinsic calibration for exterior cam 1.',
+                    ),
+                    'extrinsics_exterior_cam_2': tfds.features.Tensor(
+                        shape=(6,),
+                        dtype=np.float64,
+                        doc='Extrinsic calibration for exterior cam 2.',
+                    ),
+                    'extrinsics_wrist_cam': tfds.features.Tensor(
+                        shape=(6,),
+                        dtype=np.float64,
+                        doc='Extrinsic calibration for wrist cam.',
+                    ),
+                    'collector_id': tfds.features.Text(
+                        doc='Unique identifier for data collector.'
+                    ),
+                    'date': tfds.features.Text(
+                        doc='Date of data collection.'
+                    ),
+                    'building': tfds.features.Text(
+                        doc='Name of building in which data was collected.'
+                    ),
+                    'scene_id': tfds.features.Scalar(
+                        dtype=np.int64,
+                        doc='Unique scene ID in which data was collected.'
+                    ),
+                    'task_category': tfds.features.Text(
+                        doc='Task category (selected from a list of pre-defined categories).'
+                    ),
                 }),
             }))
 
@@ -687,12 +758,19 @@ class Droid(tfds.core.GeneratorBasedBuilder):
         """Define data splits."""
         # create list of all examples
         print("Crawling all episode paths...")
-        episode_paths = crawler(DATA_DIR)
-        print(f"Found {len(episode_paths)} candidates.")
-        episode_paths = [p for p in episode_paths if tf.io.gfile.exists(p + '/trajectory.h5') and \
-                         tf.io.gfile.exists(p + '/recordings/MP4')]
-        random.shuffle(episode_paths)
-        print(f"Found {len(episode_paths)} episodes!")
+        if self._paths is None:
+            episode_paths = tf.io.gfile.glob(DATA_DIR + "/*/*/*/*/trajectory.h5") #crawler(DATA_DIR)
+            # episode_paths = tf.io.gfile.glob(DATA_DIR + "/BVL/success/2024-01-30/*/trajectory.h5")
+            print(f"Found {len(episode_paths)} candidates.")
+            episode_paths = [p[:-14] for p in episode_paths]
+            #episode_paths = [os.path.dirname(p) for p in episode_paths if tf.io.gfile.exists(p) and \
+            #                 tf.io.gfile.exists(os.path.dirname(p) + '/recordings/MP4')]
+            random.shuffle(episode_paths)
+            #episode_paths = episode_paths[:100]
+            print(f"Found {len(episode_paths)} episodes!")
+            self._paths = episode_paths
+        else:
+            episode_paths = self._paths
         return {
             'train': episode_paths,
         }
